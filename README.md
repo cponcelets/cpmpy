@@ -20,13 +20,24 @@ Turbo accepts [XCSP3](https://xcsp.org/specifications/) and [FlatZinc](https://d
 
 ### Installation
 
-Requires the `turbo_python` package and MiniZinc. See detailed installation instructions at https://github.com/cponcelets/turbo/tree/turbo_python
+Requires the `turbo_python` package and MiniZinc:
+-  `turbo_python` is a CUDA/CMake build, and
+- MiniZinc needs its binary bundle plus a `turbo.gpu.release.msc` solver configuration registered so it can find turbo. [thirdparty/install_turbo.sh](thirdparty/install_turbo.sh) automates all of it (see [thirdparty/README.md](thirdparty/README.md)):
+
+First, set up a virtual environment with [uv](https://docs.astral.sh/uv/) (install it via `curl -LsSf https://astral.sh/uv/install.sh | sh` if you don't have it yet):
 
 ```
-pip install "cpmpy[turbo] @ git+https://github.com/cponcelets/cpmpy@turbo"
+uv venv
+source .venv/bin/activate
+uv pip install "cpmpy[turbo] @ git+https://github.com/cponcelets/cpmpy@turbo"
 ```
 
-You need to set the `turbo.gpu.release.msc` for configuring MiniZinc flattening function. (Install scripts to be added)
+Then build/install `turbo_python` and MiniZinc into that venv:
+
+```
+./thirdparty/install_turbo.sh
+source thirdparty/env.sh  # puts MiniZinc's bundle on PATH; do this in every new shell
+```
 
 ### Usage
 

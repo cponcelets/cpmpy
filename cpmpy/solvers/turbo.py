@@ -215,8 +215,20 @@ class CPM_turbo(SolverInterface):
         mzn = self.mzn_cpm
         copy_model = mzn.mzn_model.__copy__()  # it is implemented
         if add_fake_objective:
-            copy_model.add_string(f"var 0..0: {self.fake_objective_name};\n")
-            copy_model.add_string(f"solve minimize {self.fake_objective_name};\n")
+            # turbo's `best()` only reports correct variable values when the objective
+            # is a variable the search actually branches on with a real domain; a
+            # freshly declared var with a trivial/constraint-fixed domain makes it
+            # silently return sentinel values for every variable instead (verified:
+            # `var 0..0: dummy; solve minimize dummy;` and even a wider-domain dummy
+            # constrained to a constant both reproduce it). So reuse an existing user
+            # variable as a no-op objective rather than declare a new one.
+            user_vars = list(mzn.user_vars)
+            if user_vars:
+                dummy = mzn.solver_var(user_vars[0])
+                copy_model.add_string(f"solve minimize {dummy};\n")
+            else:  # no variable to reuse (a constant-only model) - fall back
+                copy_model.add_string(f"var 0..0: {self.fake_objective_name};\n")
+                copy_model.add_string(f"solve minimize {self.fake_objective_name};\n")
         else:
             copy_model.add_string(mzn.mzn_txt_solve)
 

@@ -117,6 +117,10 @@ venv.bak/
 .spyderproject
 .spyproject
 
+# turbo_python build (cloned/built by thirdparty/install_turbo.sh)
+thirdparty/lattice-land/
+thirdparty/env.sh
+
 # Rope project settings
 .ropeproject
 

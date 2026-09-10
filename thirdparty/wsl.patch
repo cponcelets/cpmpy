@@ -1,0 +1,22 @@
+diff --git a/CMakePresets.json b/CMakePresets.json
+index 328e5c51..98b3c14f 100644
+--- a/CMakePresets.json
++++ b/CMakePresets.json
+@@ -23,6 +23,10 @@
+         "REDUCE_PTX_SIZE": {
+           "type": "BOOL",
+           "value": "OFF"
++        },
++        "NO_CONCURRENT_MANAGED_MEMORY": {
++	  "type": "BOOL",
++          "value": "ON"
+         }
+       }
+     },
+@@ -285,4 +289,4 @@
+       ]
+     }
+   ]
+-}
+\ No newline at end of file
++}
