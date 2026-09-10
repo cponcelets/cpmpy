@@ -28,6 +28,7 @@ List of solver submodules
 .. autosummary::
     :nosignatures:
 
+    turbo
     ortools
     choco
     gcs
@@ -65,6 +66,7 @@ List of functions
 """
 
 from .utils import param_combinations, SolverLookup
+from .turbo import CPM_turbo
 from .ortools import CPM_ortools
 from .pysat import CPM_pysat
 from .minizinc import CPM_minizinc
@@ -84,6 +86,7 @@ from .scip import CPM_scip
 from .highs import CPM_highs
 
 __all__ = [
+    "CPM_turbo"
     "CPM_choco",
     "CPM_cplex",
     "CPM_cpo",
