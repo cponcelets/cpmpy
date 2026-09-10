@@ -31,6 +31,11 @@ Supported solvers
      - **Capabilities**
      - **Installation**
      - **Notes**
+   * - :doc:`turbo <api/solvers/turbo>`
+     - CP
+     - SAT - OPT FLOBJ
+     - pip + local install
+     - Communicates through textfiles
    * - :doc:`OR-Tools <api/solvers/ortools>`
      - CP (LCG)
      - SAT ASAT ALLSAT - OPT FLOBJ - PAR
