@@ -725,9 +725,9 @@ class CPM_minizinc(SolverInterface):
             return "alldifferent_except_0([{}])".format(",".join(args_str))
 
         if expr.name in ["lex_lesseq", "lex_less"]:
-            X = [self._convert_expression(e) for e in expr.args[0]]
-            Y = [self._convert_expression(e) for e in expr.args[1]]
-            return f"{expr.name}({{}}, {{}})".format(X, Y)
+            str_X = "[" + ",".join(self._convert_expression(e) for e in expr.args[0]) + "]"
+            str_Y = "[" + ",".join(self._convert_expression(e) for e in expr.args[1]) + "]"
+            return f"{expr.name}({str_X}, {str_Y})"
 
         if expr.name in ["lex_chain_less", "lex_chain_lesseq"]:
             arr = np.array([[self._convert_expression(e) for e in row] for row in expr.args])  # use np.array because its plain strings
@@ -804,7 +804,10 @@ class CPM_minizinc(SolverInterface):
 
             # special case: unary -
             if expr.name == '-':
-                return "-{}".format(args_str[0])
+                # parenthesize the operand: without it, negating a compound
+                # subexpression like (x + -4) is printed as "-(x) + -4" which
+                # MiniZinc parses as (-x) + -4 instead of -(x + -4)
+                return "-({})".format(args_str[0])
 
             # very special case: weighted sum (before 2-ary)
             if expr.name == 'wsum':

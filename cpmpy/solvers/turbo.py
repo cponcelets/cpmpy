@@ -101,7 +101,12 @@ class CPM_turbo(SolverInterface):
 
     _OZN_ARRAY = re.compile(r"^\s*array\s*\[[^\]]*\]\s*of\s+(bool|int|float|string)\s*:\s*([A-Za-z_]\w*)\s*=\s*(.+?);\s*$")
     _OZN_SCALAR = re.compile(r"^\s*(bool|int|float|string)\s*:\s*([A-Za-z_]\w*)\s*=\s*(.+?);\s*$")
-    
+
+    # a FlatZinc decision-variable declaration, scalar or array (e.g. `var 0..3: x;` / `array[1..2] of var bool: b;`)
+    _FZN_VAR_DECL = re.compile(r"(?m)^\s*(?:array\s*\[[^\]]*\]\s*of\s+)?var\b")
+    # a FlatZinc constraint item
+    _FZN_CONSTRAINT = re.compile(r"(?m)^\s*constraint\b")
+
     @staticmethod
     def supported():
         # try to import the package
@@ -215,17 +220,23 @@ class CPM_turbo(SolverInterface):
         mzn = self.mzn_cpm
         copy_model = mzn.mzn_model.__copy__()  # it is implemented
         if add_fake_objective:
-            # turbo's `best()` only reports correct variable values when the objective
-            # is a variable the search actually branches on with a real domain; a
-            # freshly declared var with a trivial/constraint-fixed domain makes it
-            # silently return sentinel values for every variable instead (verified:
-            # `var 0..0: dummy; solve minimize dummy;` and even a wider-domain dummy
-            # constrained to a constant both reproduce it). So reuse an existing user
-            # variable as a no-op objective rather than declare a new one.
+            # turbo's `best()` only reports correct variable values for variables that
+            # are (transitively) connected to the objective in the constraint graph;
+            # any variable outside that component comes back as an uninitialised
+            # sentinel (e.g. INT_MIN) instead of its actual assigned value (verified:
+            # `solve minimize y;` with `y` unconstrained left x/z, which the search
+            # does have to branch on to satisfy an unrelated constraint, at INT_MIN).
+            # A single reused variable is therefore not enough: sum *all* user variables
+            # (bools cast to int, so the sum type-checks) into the dummy objective, so
+            # every variable is algebraically tied to it and stays in the same component.
             user_vars = list(mzn.user_vars)
             if user_vars:
-                dummy = mzn.solver_var(user_vars[0])
-                copy_model.add_string(f"solve minimize {dummy};\n")
+                terms = []
+                for v in user_vars:
+                    sv = mzn.solver_var(v)
+                    terms.append(f"bool2int({sv})" if v.is_bool() else sv)
+                expr = " + ".join(terms)
+                copy_model.add_string(f"solve minimize ({expr});\n")
             else:  # no variable to reuse (a constant-only model) - fall back
                 copy_model.add_string(f"var 0..0: {self.fake_objective_name};\n")
                 copy_model.add_string(f"solve minimize {self.fake_objective_name};\n")
@@ -349,6 +360,27 @@ class CPM_turbo(SolverInterface):
 
         return argv
 
+    def _has_decision_vars(self, flat_model: str) -> bool:
+        """Whether the compiled FlatZinc still declares any decision variable."""
+        return self._FZN_VAR_DECL.search(flat_model) is not None
+
+    def _solve_trivial(self, flat_model: str, had_objective: bool):
+        """
+            Resolve MiniZinc model fully decided at compile time (no decision variables remain).
+            Once every variable is gone:
+            - the presence of any remaining `constraint` item means the model is unsatisfiable;
+            - none remaining means it is trivially satisfiable.
+            (Any values MiniZinc computed for eliminated variables are recovered from the .ozn model
+            via the existing `_value_of()`/`parse_ozn()` fallback, not from turbo).
+        """
+        self.turbo_solver = None
+        self.turbo_best = {}
+        self.cpm_status.runtime = 0.0
+        if self._FZN_CONSTRAINT.search(flat_model) is not None:
+            self.cpm_status.exitstatus = ExitStatus.UNSATISFIABLE
+        else:
+            self.cpm_status.exitstatus = ExitStatus.OPTIMAL if had_objective else ExitStatus.FEASIBLE
+
     def solve(self, time_limit:Optional[float]=None, **kwargs):
         """
             Call the turbo solver (the instance is created from the flatzinc )
@@ -378,21 +410,9 @@ class CPM_turbo(SolverInterface):
         # ensure all vars are known to the minizinc translator
         self.mzn_cpm.solver_vars(list(self.mzn_cpm.user_vars))
 
-         # command line
-        argv = self._build_argv(time_limit, kwargs)
-
-        # write turbo's input to a temporary file
+        # compile before building turbo's command line: a model MiniZinc can
+        # already decide at compile time (see below) never needs one
         flat_model = self.compile(add_fake_objective=not had_objective)
-        tmp = tempfile.NamedTemporaryFile(suffix=".fzn", mode="w", delete=False)
-        tmp.write(flat_model)
-        tmp.close()
-        path = Path(tmp.name)
-        argv.append(str(path))
-
-        if self.verbose:
-            print(f"turbo argv: {argv}")
-
-        self.turbo_solver = turbo_python.Turbo(argv)
 
         # fresh status for this run
         self.cpm_status = SolverStatus(self.name)
@@ -400,65 +420,90 @@ class CPM_turbo(SolverInterface):
         self.turbo_best = None
         self.objective_value_ = None
 
-        t0 = time.time()
-        try:
-            # call the solver, with parameters
-            self.turbo_solver.solve()
-            self.my_stats = self.turbo_solver.stats()
-            self.cpm_status.runtime = self._stat("solve_time", time.time() - t0)
+        # If MiniZinc already settled the question, resolve it here directly
+        # instead of handing this input to turbo.
+        if not self._has_decision_vars(flat_model):
+            self._solve_trivial(flat_model, had_objective)
+        else:
+            # command line
+            argv = self._build_argv(time_limit, kwargs)
 
-            num_solutions = self._stat("num_solutions", 0)
-            exhaustive = bool(self._stat("exhaustive", False))
+            # write turbo's input to a temporary file
+            tmp = tempfile.NamedTemporaryFile(suffix=".fzn", mode="w", delete=False)
+            tmp.write(flat_model)
+            tmp.close()
+            path = Path(tmp.name)
+            argv.append(str(path))
 
-            # CSP:                         COP:
-            # ├─ sat -> FEASIBLE           ├─ optimal -> OPTIMAL
-            # ├─ unsat -> UNSATISFIABLE    ├─ sub-optimal -> FEASIBLE
-            # └─ timeout -> UNKNOWN        ├─ unsat -> UNSATISFIABLE
-            #                              └─ timeout -> UNKNOWN
-            if num_solutions is None:
-                raise NotImplementedError(f"turbo did not report a solution count: {self.my_stats}")
-            elif num_solutions > 0:
-                if had_objective and exhaustive:
-                    self.cpm_status.exitstatus = ExitStatus.OPTIMAL
-                else:
-                    # a satisfaction problem, or an optimisation run that was cut short
-                    self.cpm_status.exitstatus = ExitStatus.FEASIBLE
-            elif exhaustive:
-                # search space explored without a solution -> unsatisfiable
-                self.cpm_status.exitstatus = ExitStatus.UNSATISFIABLE
-            else:
-                # no solution *and* the search was interrupted (timeout, memory, ...)
-                self.cpm_status.exitstatus = ExitStatus.UNKNOWN
+            if self.verbose:
+                print(f"turbo argv: {argv}")
 
-        except turbo_python.Timeout:
-            self.cpm_status.exitstatus = ExitStatus.UNKNOWN
-            try:  # stats may still be available after a timeout
+            self.turbo_solver = turbo_python.Turbo(argv)
+
+            t0 = time.time()
+            try:
+                # call the solver, with parameters
+                self.turbo_solver.solve()
                 self.my_stats = self.turbo_solver.stats()
+                self.cpm_status.runtime = self._stat("solve_time", time.time() - t0)
+
+                num_solutions = self._stat("num_solutions", 0)
+                exhaustive = bool(self._stat("exhaustive", False))
+
+                # CSP:                         COP:
+                # ├─ sat -> FEASIBLE           ├─ optimal -> OPTIMAL
+                # ├─ unsat -> UNSATISFIABLE    ├─ sub-optimal -> FEASIBLE
+                # └─ timeout -> UNKNOWN        ├─ unsat -> UNSATISFIABLE
+                #                              └─ timeout -> UNKNOWN
+                if num_solutions is None:
+                    raise NotImplementedError(f"turbo did not report a solution count: {self.my_stats}")
+                elif num_solutions > 0:
+                    if had_objective and exhaustive:
+                        self.cpm_status.exitstatus = ExitStatus.OPTIMAL
+                    else:
+                        # a satisfaction problem, or an optimisation run that was cut short
+                        self.cpm_status.exitstatus = ExitStatus.FEASIBLE
+                elif exhaustive:
+                    # search space explored without a solution -> unsatisfiable
+                    self.cpm_status.exitstatus = ExitStatus.UNSATISFIABLE
+                else:
+                    # no solution *and* the search was interrupted (timeout, memory, ...)
+                    self.cpm_status.exitstatus = ExitStatus.UNKNOWN
+
+            except turbo_python.Timeout:
+                self.cpm_status.exitstatus = ExitStatus.UNKNOWN
+                try:  # stats may still be available after a timeout
+                    self.my_stats = self.turbo_solver.stats()
+                except Exception:
+                    pass
+                self.cpm_status.runtime = self._stat("solve_time", time.time() - t0)
+
+            except turbo_python.ParseError as e:
+                self.cpm_status.exitstatus = ExitStatus.ERROR
+                self.cpm_status.runtime = time.time() - t0
+                print(f"Parse error: {e}")
+                raise e
+
+            except Exception as e:
+                self.cpm_status.exitstatus = ExitStatus.ERROR
+                self.cpm_status.runtime = time.time() - t0
+                print(f"Exception: {e}")
+                raise e
+
+            finally:
+                path.unlink(missing_ok=True)
+
+            # only turbo's own reported best() applies when it was actually invoked
+            try:
+                self.turbo_best = dict(self.turbo_solver.best())
             except Exception:
-                pass
-            self.cpm_status.runtime = self._stat("solve_time", time.time() - t0)
-
-        except turbo_python.ParseError as e:
-            self.cpm_status.exitstatus = ExitStatus.ERROR
-            self.cpm_status.runtime = time.time() - t0
-            print(f"Parse error: {e}")
-            raise e
-
-        except Exception as e:
-            self.cpm_status.exitstatus = ExitStatus.ERROR
-            self.cpm_status.runtime = time.time() - t0
-            print(f"Exception: {e}")
-            raise e
-
-        finally:
-            path.unlink(missing_ok=True)
+                self.turbo_best = {}
 
         # True/False depending on self.cpm_status
         has_sol = self._solve_return(self.cpm_status)
 
         # translate solution values (of user specified variables only)
         if has_sol:
-            self.turbo_best = dict(self.turbo_solver.best())
             # fill in variable values
             for cpm_var in self.mzn_cpm.user_vars:
                 value = self._value_of(cpm_var.name)
@@ -743,6 +788,9 @@ class CPM_turbo(SolverInterface):
                 self
         """
         self.mzn_cpm.add(cpm_expr)
+        # keep in sync with the translator's bookkeeping (not just at solve() time,
+        # so e.g. `.user_vars` is correct for callers inspecting it before solving)
+        self.user_vars = self.mzn_cpm.user_vars
         # a new constraint invalidates the cached compilation
         self.mzn_fzn = self.mzn_ozn = self.flat_constants = None
         return self
