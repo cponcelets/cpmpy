@@ -4,7 +4,8 @@
 ![turbo tests failing](https://img.shields.io/badge/turbo%20tests-149%20failing-red)
 ![turbo tests skipped](https://img.shields.io/badge/turbo%20tests-24%20skipped-lightgrey)
 
-<sub>`pytest --forked tests/ --solver=turbo`, 2026-09-16 (overnight run) — update after the next full rerun, these are manually maintained, not CI-linked.</sub>
+<sub>`pytest --forked tests/ --solver=turbo`, 2026-09-16 — update after the next full rerun, these are manually maintained, not CI-linked.</sub>
+<sub>- Fail reasons: Incremental sovling and solveAll not supported yet.<sub>
 
 ## Content
 
