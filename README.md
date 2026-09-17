@@ -1,10 +1,10 @@
 # <b>CPMpy-turbo</b>: Integrating the <a href="https://github.com/ptal/turbo">turbo</a> solver into <a href="https://github.com/CPMpy/cpmpy">CPMpy</a>
 
-![turbo tests passing](https://img.shields.io/badge/turbo%20tests-14%2C328%20passing-brightgreen)
-![turbo tests failing](https://img.shields.io/badge/turbo%20tests-151%20failing-red)
+![turbo tests passing](https://img.shields.io/badge/turbo%20tests-14%2C330%20passing-brightgreen)
+![turbo tests failing](https://img.shields.io/badge/turbo%20tests-149%20failing-red)
 ![turbo tests skipped](https://img.shields.io/badge/turbo%20tests-24%20skipped-lightgrey)
 
-<sub>`pytest --forked tests/ --solver=turbo`, 2026-09-16 — update after the next full rerun, these are manually maintained, not CI-linked.</sub>
+<sub>`pytest --forked tests/ --solver=turbo`, 2026-09-16 (overnight run) — update after the next full rerun, these are manually maintained, not CI-linked.</sub>
 
 ## Content
 
