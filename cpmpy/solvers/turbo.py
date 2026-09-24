@@ -44,6 +44,7 @@ import warnings
 from typing import Any, Optional
 
 from .solver_interface import SolverInterface, SolverStatus, ExitStatus, Callback
+from ..exceptions import NotSupportedError
 from ..expressions.core import Expression, NestedBoolExprLike
 from ..expressions.variables import _NumVarImpl, intvar
 from ..expressions.utils import is_num, is_any_list, argvals
@@ -334,9 +335,20 @@ class CPM_turbo(SolverInterface):
 
     def _build_argv(self, time_limit, kwargs) -> list:
         """Translate CPMpy kwargs into a turbo command line."""
-        argv = []
+        # turbo's C++ argument parser follows the standard C `main(argc, argv)`
+        # convention: argv[0] is the program name and is skipped, real options
+        # start at argv[1].
+        argv = ["turbo"]
+
+        arch = kwargs.pop("arch", None)
+        if arch is not None and str(arch).lower() == "gpu":
+            warnings.warn("CPM_turbo: arch='gpu' is not supported anymore.")
+            arch = None
+
         for key, value in kwargs.items():
-            flag = f"-{key}" if len(key) == 1 else f"--{key}"
+            # turbo's CLI uses a single dash for every option, regardless of name
+            # length (e.g. -arch, -seed, -stack, -timeout).
+            flag = f"-{key}"
             if isinstance(value, bool):
                 if not value:
                     continue  # a False flag is simply not passed
@@ -346,14 +358,13 @@ class CPM_turbo(SolverInterface):
             else:  # non-boolean parameters get a value (this branch was unreachable before)
                 argv.extend([flag, str(value)])
 
-        # turbo needs '-a' to report intermediate solutions; don't pass it twice
-        if not any(a in ("-a", "--all", "--print-intermediate-solutions") for a in argv):
-            argv.insert(0, "-a")
+        if arch is not None:
+            argv.extend(["-arch", str(arch)])
 
         if time_limit is not None:
             if time_limit <= 0:
                 raise ValueError("Time limit must be positive")
-            if not any(a in ("-t", "--timeout") for a in argv):
+            if not any(a in ("-t", "-timeout") for a in argv):
                 # turbo expects an integer number of milliseconds (Configuration::timeout_ms)
                 t = int(round(time_limit * 1000)) if self.time_limit_in_ms else int(round(time_limit))
                 argv.extend(["-t", str(max(t, 1))])
@@ -376,10 +387,15 @@ class CPM_turbo(SolverInterface):
         self.turbo_solver = None
         self.turbo_best = {}
         self.cpm_status.runtime = 0.0
-        if self._FZN_CONSTRAINT.search(flat_model) is not None:
-            self.cpm_status.exitstatus = ExitStatus.UNSATISFIABLE
-        else:
-            self.cpm_status.exitstatus = ExitStatus.OPTIMAL if had_objective else ExitStatus.FEASIBLE
+        is_sat = self._FZN_CONSTRAINT.search(flat_model) is None
+        self.cpm_status.exitstatus = (
+            ExitStatus.UNSATISFIABLE if not is_sat else
+            ExitStatus.OPTIMAL if had_objective else
+            ExitStatus.FEASIBLE
+        )
+        # keep num_solutions consistent with the real turbo path, so callers reading
+        # it directly (e.g. solveAll()) get the right answer for this trivial case too
+        self.my_stats = {"num_solutions": 1 if is_sat else 0, "exhaustive": True}
 
     def solve(self, time_limit:Optional[float]=None, **kwargs):
         """
@@ -410,9 +426,13 @@ class CPM_turbo(SolverInterface):
         # ensure all vars are known to the minizinc translator
         self.mzn_cpm.solver_vars(list(self.mzn_cpm.user_vars))
 
+        # the fake-objective workaround (see compile()/_flatten()) is only needed for
+        # turbo's default architecture ('barebones').
+        is_cpu_arch = isinstance(kwargs.get("arch"), str) and kwargs["arch"].lower() == "cpu"
+
         # compile before building turbo's command line: a model MiniZinc can
         # already decide at compile time (see below) never needs one
-        flat_model = self.compile(add_fake_objective=not had_objective)
+        flat_model = self.compile(add_fake_objective=(not had_objective) and not is_cpu_arch)
 
         # fresh status for this run
         self.cpm_status = SolverStatus(self.name)
@@ -806,33 +826,37 @@ class CPM_turbo(SolverInterface):
             and optionally display the solutions.
 
             .. warning::
-                turbo's Python API only exposes the *best* solution (`best()`), so this
-                cannot enumerate solutions the way other CPMpy solvers do: it returns the
-                number of solutions turbo reports and, if `display` is given, displays the
-                best/last one only. For an optimisation problem, '-a' makes turbo report
-                *improving* solutions, so the count is a number of improvements, not a
-                number of distinct optimal solutions.
+                Only 'arch="cpu"' has been verified to report a true solution count, 
+                so solveAll() *requires* it and raises NotSupportedError otherwise.
+                Even with 'arch="cpu"', turbo's Python API only ever exposes the *last* solution's values
+                via `best()` - so `display`, if given, is still only called once,
+                on that last solution, not once per solution found.
 
             Arguments:
                 - display: either a list of CPMpy expressions, OR a callback function, called with the variables after value-mapping
                         default/None: nothing displayed
                 - time_limit: stop after this many seconds (default: None)
-                - solution_limit: stop after this many solutions (default: None)
+                - solution_limit: stop after this many solutions (default: None); passed through to turbo's own '-n' flag
                 - call_from_model: whether the method is called from a CPMpy Model instance or not
+                - arch: must be "cpu" (see warning above)
                 - any other keyword argument
 
-            Returns: number of solutions found
+            Returns: the number of solutions found (see warning above for `display`'s limitation)
         """
+        arch = kwargs.get("arch")
+        if not (isinstance(arch, str) and arch.lower() == "cpu"):
+            raise NotSupportedError(
+                "CPM_turbo: solveAll() requires arch='cpu' to enumerate solutions.")
+
         if solution_limit is not None:
-            warnings.warn("CPM_turbo: 'solution_limit' is not supported by turbo, ignoring it.")
+            kwargs["n"] = solution_limit  # turbo's own solution-count limit (satisfaction problems only)
 
         kwargs.setdefault("a", True)  # report intermediate solutions
         self.solve(time_limit=time_limit, **kwargs)  # note: **kwargs, not kwargs
 
-        if display is not None:
-            warnings.warn("CPM_turbo: turbo only exposes its best solution, "
-                          "'display' is called once, on that solution.")
-            if self._solve_return(self.cpm_status):
-                self.print_display(display)
+        has_sol = self._solve_return(self.cpm_status)
+
+        if display is not None and has_sol:
+            self.print_display(display)
 
         return self._stat("num_solutions", 0)
