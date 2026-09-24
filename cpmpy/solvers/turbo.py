@@ -335,10 +335,7 @@ class CPM_turbo(SolverInterface):
 
     def _build_argv(self, time_limit, kwargs) -> list:
         """Translate CPMpy kwargs into a turbo command line."""
-        # turbo's C++ argument parser follows the standard C `main(argc, argv)`
-        # convention: argv[0] is the program name and is skipped, real options
-        # start at argv[1].
-        argv = ["turbo"]
+        argv = []
 
         arch = kwargs.pop("arch", None)
         if arch is not None and str(arch).lower() == "gpu":
