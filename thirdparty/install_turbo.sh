@@ -309,13 +309,18 @@ install_msc() {
     local dest_dir="$HOME/.minizinc/solvers"
     mkdir -p "$dest_dir"
 
-    python3 - "$msc_src" "$turbo_dir" "$dest_dir/turbo.$flavor.release.msc" <<'PYEOF'
+    # the turbo_python branch builds a Python extension (.so).
+    local so_file
+    so_file="$(find "$turbo_dir/build/$PRESET" -maxdepth 1 -name 'turbo_python*.so' | head -1)"
+    [[ -n "$so_file" ]] || die "No turbo_python*.so found under $turbo_dir/build/$PRESET - run the build step first"
+
+    python3 - "$msc_src" "$turbo_dir" "$so_file" "$dest_dir/turbo.$flavor.release.msc" <<'PYEOF'
 import json, re, sys
-src, turbo_dir, dest = sys.argv[1:4]
+src, turbo_dir, so_file, dest = sys.argv[1:5]
 with open(src) as f:
     cfg = json.load(f)
 old_prefix = re.match(r"(.*)/build/", cfg["executable"]).group(1)
-cfg["executable"] = cfg["executable"].replace(old_prefix, turbo_dir)
+cfg["executable"] = so_file
 cfg["mznlib"] = cfg["mznlib"].replace(old_prefix, turbo_dir)
 with open(dest, "w") as f:
     json.dump(cfg, f, indent=4)
