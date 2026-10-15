@@ -38,9 +38,14 @@
         CPM_turbo
 """
 
+import json
+import os
 import re
+import subprocess
+import sys
 import time
 import warnings
+from pathlib import Path
 from typing import Any, Optional
 
 from .solver_interface import SolverInterface, SolverStatus, ExitStatus, Callback
@@ -59,6 +64,89 @@ class _Unknown:
 
 _UNKNOWN = _Unknown()
 
+
+class TurboTimeout(Exception):
+    """An isolated turbo solve"""
+
+
+class TurboProcessError(RuntimeError):
+    """The process running an isolated turbo solve"""
+
+    def __init__(self, message: str, returncode: Optional[int], output: str):
+        super().__init__(message)
+        self.returncode = returncode
+        self.output = output
+
+
+class _TurboProcess:
+    """Same interface as ``turbo_python.Turbo`` (``solve()``, ``stats()``,
+    ``best()``), but ``solve()`` runs turbo in a fresh child process
+    (turbo_worker.py) that exits when the solve is over, to free GPU memory.
+    It also contains what turbo does on a CUDA error
+    (``exit()``) and to stdout (prints solutions and warnings).
+
+    ``output`` holds everything turbo printed, after ``solve()``.
+    """
+
+    WORKER = Path(__file__).with_name("turbo_worker.py")
+
+    def __init__(self, argv: list, kill_after: Optional[float]):
+        """
+        Arguments:
+            argv: list[str], turbo's command line, as ``turbo_python.Turbo(argv)``
+                  takes it: the options built by ``CPM_turbo._build_argv`` (e.g.
+                  ``-t <ms>``), followed by the path of the ``.fzn`` file to solve.
+                  The child process reads that file, so it must still exist
+                  when ``solve()`` runs.
+            kill_after: float or None, seconds after which the child process is
+                  killed if it is still running (``solve()`` then raises
+                  ``TurboTimeout``). ``CPM_turbo`` passes its ``time_limit`` plus
+                  ``isolate_grace_s``; None means never kill it.
+        """
+        self.argv = list(argv)
+        self.kill_after = kill_after
+        self.output = ""
+        self.returncode: Optional[int] = None
+        self._stats: Optional[dict] = None
+        self._best: Optional[dict] = None
+
+    def solve(self) -> None:
+        request = json.dumps({"argv": self.argv, "parent_pid": os.getpid()})
+        proc = subprocess.Popen([sys.executable, str(self.WORKER)],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        try:
+            reply_text, self.output = proc.communicate(request, timeout=self.kill_after)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _, self.output = proc.communicate()
+            self.returncode = proc.returncode
+            raise TurboTimeout(f"turbo was still running {self.kill_after:.0f}s after "
+                               "starting and was killed")
+        self.returncode = proc.returncode
+        try:
+            reply = json.loads(reply_text)
+        except ValueError:
+            tail = self.output.strip()[-2000:]
+            raise TurboProcessError(
+                f"turbo's process exited with code {proc.returncode} without a result"
+                + (f"; it printed:\n{tail}" if tail else ""),
+                proc.returncode, self.output) from None
+        self._stats, self._best = reply.get("stats"), reply.get("best")
+        if "error" in reply:
+            raise RuntimeError(f"{reply['error']['type']}: {reply['error']['message']}")
+
+    def stats(self) -> dict:
+        if self._stats is None:
+            raise RuntimeError("no statistics: the solve did not run")
+        return self._stats
+
+    def best(self) -> dict:
+        if self._best is None:
+            raise RuntimeError("no solution: the solve did not run")
+        return self._best
+
+
 class CPM_turbo(SolverInterface):
     """
     Interface to turbo's API
@@ -66,7 +154,8 @@ class CPM_turbo(SolverInterface):
     Creates the following attributes (see parent constructor for more):
 
     - ``mzn_cpm``: object, the minizinc cpmpy instance (used as MiniZinc -> FlatZinc translator)
-    - ``turbo_solver``: object, the turbo solver instance
+    - ``turbo_solver``: object, the turbo solver instance (a ``_TurboProcess`` when ``isolate`` is on)
+    - ``turbo_output``: str, what turbo printed during the last isolated solve
     - ``turbo_best``: dict, the best solution of the previous solve (FlatZinc names -> values)
     - ``my_stats``: dict, the statistics of the previous solve
     - ``mzn_fzn``: str, the FlatZinc text handed to turbo during the last compile
@@ -99,6 +188,16 @@ class CPM_turbo(SolverInterface):
     #: turbo's '-t' option is expressed in milliseconds (`Configuration::timeout_ms`),
     #: while CPMpy's `time_limit` is in seconds. Set to False if your build expects seconds.
     time_limit_in_ms = True
+
+    #: Run each solve in its own process (see ``_TurboProcess``), so the GPU
+    #: memory turbo reserves is released when the solve ends. Per call:
+    #: ``solve(isolate=False)`` runs turbo in this process instead.
+    isolate = True
+
+    #: An isolated solve still running this many seconds past its time limit
+    #: is killed (``TurboTimeout``, status UNKNOWN). Covers process start-up,
+    #: CUDA initialisation and turbo overrunning its own limit.
+    isolate_grace_s = 30.0
 
     _OZN_ARRAY = re.compile(r"^\s*array\s*\[[^\]]*\]\s*of\s+(bool|int|float|string)\s*:\s*([A-Za-z_]\w*)\s*=\s*(.+?);\s*$")
     _OZN_SCALAR = re.compile(r"^\s*(bool|int|float|string)\s*:\s*([A-Za-z_]\w*)\s*=\s*(.+?);\s*$")
@@ -179,6 +278,7 @@ class CPM_turbo(SolverInterface):
         # initialise the native solver object
         self.mzn_cpm = cpmpy.SolverLookup.get("minizinc:turbo.gpu.release")
         self.turbo_solver = None
+        self.turbo_output = ""
         self.turbo_best = None
         self.my_stats = None
         self.verbose = verbose
@@ -404,6 +504,8 @@ class CPM_turbo(SolverInterface):
                            either a list of CPMpy expressions, OR a callback function which
                            gets called after the variable-value mapping of the intermediate solution.
                            default/None: nothing is displayed
+            - isolate:     run turbo in its own process (default: ``CPM_turbo.isolate``),
+                           which frees the GPU memory turbo reserved when the solve ends
             - kwargs:      any keyword argument, sets parameters of solver object
 
             Arguments that correspond to solver parameters:
@@ -422,6 +524,13 @@ class CPM_turbo(SolverInterface):
         self.solver_vars(list(self.user_vars))
         # ensure all vars are known to the minizinc translator
         self.mzn_cpm.solver_vars(list(self.mzn_cpm.user_vars))
+
+        isolate = bool(kwargs.pop("isolate", self.isolate))
+        # turbo_python itself defines neither: an empty tuple catches nothing
+        timeout_errors = (TurboTimeout,) + tuple(
+            e for e in (getattr(turbo_python, "Timeout", None),) if e is not None)
+        parse_errors = tuple(
+            e for e in (getattr(turbo_python, "ParseError", None),) if e is not None)
 
         # the fake-objective workaround (see compile()/_flatten()) is only needed for
         # turbo's default architecture ('barebones').
@@ -455,7 +564,11 @@ class CPM_turbo(SolverInterface):
             if self.verbose:
                 print(f"turbo argv: {argv}")
 
-            self.turbo_solver = turbo_python.Turbo(argv)
+            if isolate:
+                kill_after = None if time_limit is None else time_limit + self.isolate_grace_s
+                self.turbo_solver = _TurboProcess(argv, kill_after)
+            else:
+                self.turbo_solver = turbo_python.Turbo(argv)
 
             t0 = time.time()
             try:
@@ -487,7 +600,7 @@ class CPM_turbo(SolverInterface):
                     # no solution *and* the search was interrupted (timeout, memory, ...)
                     self.cpm_status.exitstatus = ExitStatus.UNKNOWN
 
-            except turbo_python.Timeout:
+            except timeout_errors:
                 self.cpm_status.exitstatus = ExitStatus.UNKNOWN
                 try:  # stats may still be available after a timeout
                     self.my_stats = self.turbo_solver.stats()
@@ -495,20 +608,21 @@ class CPM_turbo(SolverInterface):
                     pass
                 self.cpm_status.runtime = self._stat("solve_time", time.time() - t0)
 
-            except turbo_python.ParseError as e:
+            except parse_errors as e:
                 self.cpm_status.exitstatus = ExitStatus.ERROR
                 self.cpm_status.runtime = time.time() - t0
-                print(f"Parse error: {e}")
+                print(f"Parse error: {e}", file=sys.stderr)
                 raise e
 
             except Exception as e:
                 self.cpm_status.exitstatus = ExitStatus.ERROR
                 self.cpm_status.runtime = time.time() - t0
-                print(f"Exception: {e}")
+                print(f"Exception: {e}", file=sys.stderr)
                 raise e
 
             finally:
                 path.unlink(missing_ok=True)
+                self.turbo_output = getattr(self.turbo_solver, "output", "")
 
             # only turbo's own reported best() applies when it was actually invoked
             try:
