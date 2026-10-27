@@ -52,7 +52,7 @@ from .solver_interface import SolverInterface, SolverStatus, ExitStatus, Callbac
 from ..exceptions import NotSupportedError
 from ..expressions.core import Expression, NestedBoolExprLike
 from ..expressions.variables import _NumVarImpl, intvar
-from ..expressions.utils import is_num, is_any_list, argvals
+from ..expressions.utils import is_num, is_any_list, argvals, flatlist
 
 
 class _Unknown:
@@ -337,12 +337,12 @@ class CPM_turbo(SolverInterface):
                     sv = mzn.solver_var(v)
                     terms.append(f"bool2int({sv})" if v.is_bool() else sv)
                 expr = " + ".join(terms)
-                copy_model.add_string(f"solve minimize ({expr});\n")
+                copy_model.add_string(self._annotated(f"solve minimize ({expr});\n"))
             else:  # no variable to reuse (a constant-only model) - fall back
                 copy_model.add_string(f"var 0..0: {self.fake_objective_name};\n")
-                copy_model.add_string(f"solve minimize {self.fake_objective_name};\n")
+                copy_model.add_string(self._annotated(f"solve minimize {self.fake_objective_name};\n"))
         else:
-            copy_model.add_string(mzn.mzn_txt_solve)
+            copy_model.add_string(self._annotated(mzn.mzn_txt_solve))
 
         inst = minizinc.Instance(mzn.mzn_solver, copy_model)
         with inst.flat(**flat_kwargs) as (fzn, ozn, statistics):
@@ -880,6 +880,70 @@ class CPM_turbo(SolverInterface):
 
     def has_objective(self):
         return self.mzn_cpm.has_objective()
+
+    #: The search vocabulary of ``set_search``: MiniZinc's int_search/bool_search
+    #: variable and value selection annotations.
+    search_var_orders = ("input_order", "first_fail", "anti_first_fail", "smallest", "largest")
+    search_value_orders = ("indomain_min", "indomain_max", "indomain_split",
+                           "indomain_reverse_split", "indomain_median")
+    # bool_search only takes min/max: the other value orders map to the nearest
+    _BOOL_VALUE_ORDER = {"indomain_split": "indomain_min", "indomain_median": "indomain_min",
+                         "indomain_reverse_split": "indomain_max"}
+
+    def set_search(self, *strategies):
+        """
+            Set the branching order of the next solves, as a MiniZinc search
+            annotation on the model's solve item: turbo follows it unless run
+            with ``f=True`` (free search).
+
+            Each strategy is ``(vars, var_order, value_order)``: decision
+            variables (a variable, or a (nested) list/array of them), then
+            one of ``search_var_orders`` and one of ``search_value_orders``.
+            Several strategies apply in order (``seq_search``); within one,
+            each run of Boolean variables becomes a ``bool_search`` (value
+            orders other than min/max taken as the nearest of the two), each
+            run of integer variables an ``int_search``. ``set_search()`` with
+            no strategy goes back to turbo's own search.
+
+            Example::
+
+                s.set_search((prec, "input_order", "indomain_max"),
+                             (start, "smallest", "indomain_min"))
+        """
+        annotations = []
+        for strategy in strategies:
+            if len(strategy) != 3:
+                raise ValueError(f"a search strategy is (vars, var_order, value_order), got {strategy!r}")
+            cpm_vars, var_order, value_order = strategy
+            if var_order not in self.search_var_orders:
+                raise ValueError(f"var_order must be one of {self.search_var_orders}, got {var_order!r}")
+            if value_order not in self.search_value_orders:
+                raise ValueError(f"value_order must be one of {self.search_value_orders}, got {value_order!r}")
+            flat = list(flatlist([cpm_vars]))
+            if not flat or not all(isinstance(v, _NumVarImpl) for v in flat):
+                raise ValueError("set_search takes decision variables, not expressions or constants")
+            # consecutive runs of the same type keep the order the caller gave
+            run: list = []
+            for v in flat + [None]:
+                if run and (v is None or v.is_bool() != run[0].is_bool()):
+                    names = ", ".join(self.solver_var(x) for x in run)
+                    if run[0].is_bool():
+                        value = self._BOOL_VALUE_ORDER.get(value_order, value_order)
+                        annotations.append(f"bool_search([{names}], {var_order}, {value})")
+                    else:
+                        annotations.append(f"int_search([{names}], {var_order}, {value_order})")
+                    run = []
+                if v is not None:
+                    run.append(v)
+        self._search = annotations
+
+    def _annotated(self, solve_item: str) -> str:
+        """The solve item with the ``set_search`` annotation, if any."""
+        annotations = getattr(self, "_search", [])
+        if not annotations:
+            return solve_item
+        ann = annotations[0] if len(annotations) == 1 else f"seq_search([{', '.join(annotations)}])"
+        return re.sub(r"\bsolve\b", f"solve :: {ann}", solve_item, count=1)
 
     # `add()` first calls `transform()`
     def transform(self, cpm_expr: NestedBoolExprLike) -> list[Expression]:
